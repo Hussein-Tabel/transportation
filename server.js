@@ -7,6 +7,8 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const { log } = require("console");
+const cron = require("node-cron");
+const { sendNotificationToPassengers } = require("./notification");
 
 // App setup
 const app = express();
@@ -37,6 +39,75 @@ const db = mysql.createPool({
   connectionLimit: 10,
   queueLimit: 0,
   multipleStatements: true,
+});
+
+const connection = db.promise();
+
+async function updateTripStatuses() {
+  try {
+    await connection.query(`
+      UPDATE trip
+      SET STATUS_TRIP = 'Complete'
+      WHERE 
+        CONCAT(
+          CASE 
+            WHEN RETURN_TIME < DEPARTURE_TIME THEN TRIP_DATE
+            ELSE TRIP_DATE
+          END, 
+          ' ',
+          RETURN_TIME
+        ) < DATE_ADD(NOW(), INTERVAL 3 HOUR)
+        AND STATUS_TRIP NOT IN ('Cancelled', 'Complete')
+    `);
+
+    await connection.query(`
+      UPDATE trip
+      SET STATUS_TRIP = 'Active'
+      WHERE 
+        CONCAT(TRIP_DATE, ' ', DEPARTURE_TIME) <= DATE_ADD(NOW(), INTERVAL 3 HOUR)
+        AND CONCAT(
+          CASE 
+            WHEN RETURN_TIME < DEPARTURE_TIME THEN DATE_ADD(TRIP_DATE, INTERVAL 1 DAY)
+            ELSE TRIP_DATE
+          END, 
+          ' ',
+          RETURN_TIME
+        ) >= DATE_ADD(NOW(), INTERVAL 3 HOUR)
+        AND STATUS_TRIP NOT IN ('Cancelled', 'Complete')
+    `);
+
+    await connection.query(`
+      UPDATE trip t
+      JOIN (
+        SELECT TRIP_ID, COUNT(*) AS bookedSeats FROM book GROUP BY TRIP_ID
+      ) b ON b.TRIP_ID = t.TRIP_ID
+      JOIN driver_captin_trip dct ON dct.TRIP_ID = t.TRIP_ID
+      JOIN bus bs ON bs.BUS_ID = dct.BUS_ID
+      SET t.STATUS_TRIP = 'Full'
+      WHERE b.bookedSeats >= bs.CAPACITY
+        AND t.STATUS_TRIP NOT IN ('Cancelled', 'Complete', 'Active')
+    `);
+
+    await connection.query(`
+      UPDATE trip
+      SET STATUS_TRIP = 'Cancelled'
+      WHERE STATUS_TRIP NOT IN ('Complete', 'Cancelled', 'Active')
+        AND CONCAT(TRIP_DATE, ' ', DEPARTURE_TIME) <= DATE_ADD(DATE_ADD(NOW(), INTERVAL 3 HOUR), INTERVAL 5 MINUTE)
+        AND TRIP_ID NOT IN (SELECT DISTINCT TRIP_ID FROM book)
+    `);
+
+    await connection.query(`
+      UPDATE trip
+      SET STATUS_TRIP = 'Pending'
+      WHERE STATUS_TRIP NOT IN ('Full', 'Active', 'Complete', 'Cancelled')
+    `);
+  } catch (error) {
+    console.error("Error updating trip statuses:", error);
+  }
+}
+
+cron.schedule("* * * * *", () => {
+  updateTripStatuses();
 });
 
 // Generate defaulte password
@@ -203,7 +274,7 @@ Transport Management System`,
   return transporter.sendMail(mailOptions);
 }
 
-// Create or update driver
+// Create or Update Driver with soft delete logic
 app.post("/admin/createDriver", async (req, res) => {
   const {
     fullName,
@@ -217,13 +288,33 @@ app.post("/admin/createDriver", async (req, res) => {
   } = req.body;
 
   try {
+    // Check for existing active driver with same email
+    const [activeDriverEmail] = await db.promise().query(
+      `SELECT u.USER_ID FROM users u
+       JOIN driver d ON d.DRIVER_ID = u.USER_ID
+       WHERE u.USER_EMAIL = ? AND d.AVAILABILITY = 0`,
+      [email]
+    );
+
+    if (activeDriverEmail.length > 0) {
+      return res.json({
+        success: false,
+        message: "Email already used by an active driver",
+      });
+    }
+
+    // Check if user with this email exists
     const [existingUser] = await db
       .promise()
       .query("SELECT * FROM users WHERE USER_EMAIL = ?", [email]);
 
+    // Check if license number already exists (only for available drivers)
     const [existingLicense] = await db
       .promise()
-      .query("SELECT * FROM driver WHERE LICENSE_NUMBER = ?", [license_num]);
+      .query(
+        "SELECT * FROM driver WHERE LICENSE_NUMBER = ? AND AVAILABILITY = 0",
+        [license_num]
+      );
 
     if (existingLicense.length > 0) {
       return res.json({
@@ -239,7 +330,7 @@ app.post("/admin/createDriver", async (req, res) => {
       const user = existingUser[0];
 
       if (user.TYPE_ID === 3) {
-        // Update existing user from passenger to driver, with new password
+        // Update existing user from passenger to driver
         await db
           .promise()
           .query(
@@ -251,6 +342,15 @@ app.post("/admin/createDriver", async (req, res) => {
 
         // Send email with new temp password
         await sendDriverEmail(email, fullName, tempPassword);
+      } else if (user.TYPE_ID === 2) {
+        // Already a driver, just update name and phone
+        userId = user.USER_ID;
+        await db
+          .promise()
+          .query(
+            `UPDATE users SET FULL_NAME = ?, PHONE_NUMBER = ? WHERE USER_ID = ?`,
+            [fullName, phone, userId]
+          );
       } else {
         return res.json({
           success: false,
@@ -270,17 +370,46 @@ app.post("/admin/createDriver", async (req, res) => {
       await sendDriverEmail(email, fullName, tempPassword);
     }
 
-    // Check if already exists in driver table
-    const [existingDriver] = await db
+    // Check if driver exists with AVAILABILITY = 1 (archived)
+    const [archivedDriver] = await db
       .promise()
-      .query("SELECT * FROM driver WHERE DRIVER_ID = ?", [userId]);
+      .query(`SELECT * FROM driver WHERE DRIVER_ID = ? AND AVAILABILITY = 1`, [
+        userId,
+      ]);
 
-    if (existingDriver.length === 0) {
-      await db.promise().query(
-        `INSERT INTO driver (DRIVER_ID, SALARY, MANAGER_ID, LICENSE_NUMBER, LICENSE_TYPE, JOIN_DATE)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [userId, salary, managerId, license_num, license_type, join_date]
-      );
+    if (archivedDriver.length > 0) {
+      // Reactivate driver
+      await db
+        .promise()
+        .query(
+          `UPDATE driver SET AVAILABILITY = 0, SALARY = ?, MANAGER_ID = ?, LICENSE_NUMBER = ?, LICENSE_TYPE = ?, JOIN_DATE = ? WHERE DRIVER_ID = ?`,
+          [salary, managerId, license_num, license_type, join_date, userId]
+        );
+    } else {
+      // Check if already active driver exists
+      const [existingDriver] = await db
+        .promise()
+        .query(
+          "SELECT * FROM driver WHERE DRIVER_ID = ? AND AVAILABILITY = 0",
+          [userId]
+        );
+
+      if (existingDriver.length === 0) {
+        // Insert new driver
+        await db.promise().query(
+          `INSERT INTO driver (DRIVER_ID, SALARY, MANAGER_ID, LICENSE_NUMBER, LICENSE_TYPE, JOIN_DATE, AVAILABILITY)
+           VALUES (?, ?, ?, ?, ?, ?, 0)`,
+          [userId, salary, managerId, license_num, license_type, join_date]
+        );
+      } else {
+        // Update existing active driver
+        await db
+          .promise()
+          .query(
+            `UPDATE driver SET SALARY = ?, MANAGER_ID = ?, LICENSE_NUMBER = ?, LICENSE_TYPE = ?, JOIN_DATE = ? WHERE DRIVER_ID = ?`,
+            [salary, managerId, license_num, license_type, join_date, userId]
+          );
+      }
     }
 
     res.json({
@@ -293,7 +422,7 @@ app.post("/admin/createDriver", async (req, res) => {
   }
 });
 
-// Get drivers under a manager
+// Get drivers under a manager (only available ones)
 app.get("/admin/drivers", (req, res) => {
   const managerId = req.query.managerId;
 
@@ -333,7 +462,7 @@ app.get("/admin/drivers", (req, res) => {
       ) AS available
     FROM driver d
     JOIN users u ON u.USER_ID = d.DRIVER_ID
-    WHERE d.MANAGER_ID = ?;
+    WHERE d.MANAGER_ID = ? AND d.AVAILABILITY = 0;
   `;
 
   db.query(query, [managerId], (err, result) => {
@@ -342,75 +471,51 @@ app.get("/admin/drivers", (req, res) => {
   });
 });
 
-// Delete driver
-app.post("/admin/deleteDriver", (req, res) => {
+// Soft delete (archive) driver by setting AVAILABILITY = 1
+app.post("/admin/deleteDriver", async (req, res) => {
   const { driverId } = req.body;
 
-  db.getConnection((err, connection) => {
-    connection.beginTransaction((err) => {
-      connection.query(
-        `DELETE FROM driver_captin_trip WHERE DRIVER_ID = ?`,
-        [driverId],
-        (err, result) => {
-          if (err) {
-            return connection.rollback(() => {
-              connection.release();
-              res.status(500).json({
-                success: false,
-                message: "Failed to delete related trips",
-              });
-            });
-          }
+  try {
+    const connection = db.promise();
 
-          connection.query(
-            `DELETE FROM driver WHERE DRIVER_ID = ?`,
-            [driverId],
-            (err, result) => {
-              if (err) {
-                return connection.rollback(() => {
-                  connection.release();
-                  res.status(500).json({
-                    success: false,
-                    message: "Failed to delete driver record",
-                  });
-                });
-              }
+    // Check if driver is assigned to any current or future trip (not cancelled)
+    const [tripRows] = await connection.query(
+      `
+      SELECT COUNT(*) AS count
+      FROM driver_captin_trip dct
+      JOIN trip t ON dct.TRIP_ID = t.TRIP_ID
+      WHERE dct.DRIVER_ID = ?
+        AND CONCAT(t.TRIP_DATE, ' ', t.DEPARTURE_TIME) >= DATE_ADD(NOW(), INTERVAL 3 HOUR)
+        AND t.STATUS_TRIP != 'Cancelled'
+      `,
+      [driverId]
+    );
 
-              connection.query(
-                `DELETE FROM users WHERE USER_ID = ? AND TYPE_ID = 2`,
-                [driverId],
-                (err, result) => {
-                  if (err) {
-                    return connection.rollback(() => {
-                      connection.release();
-                      res.status(500).json({
-                        success: false,
-                        message: "Failed to delete user record",
-                      });
-                    });
-                  }
+    if (tripRows[0].count > 0) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Cannot archive driver: They are assigned to a current or future trip",
+      });
+    }
 
-                  connection.commit((err) => {
-                    connection.release();
-                    if (err) {
-                      return res.status(500).json({
-                        success: false,
-                        message: "Transaction commit failed",
-                      });
-                    }
-                    res.json({
-                      success: true,
-                      message: "Driver deleted successfully",
-                    });
-                  });
-                }
-              );
-            }
-          );
-        }
-      );
+    // Proceed with soft delete
+    await connection.query(
+      `UPDATE driver SET AVAILABILITY = 1 WHERE DRIVER_ID = ?`,
+      [driverId]
+    );
+
+    res.json({
+      success: true,
+      message: "Driver archived successfully",
     });
-  });
+  } catch (err) {
+    console.error("Soft delete driver error:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error while archiving driver",
+    });
+  }
 });
 
 // Update driver
@@ -593,85 +698,48 @@ app.post("/admin/createPassenger", async (req, res) => {
 app.get("/admin/buses", (req, res) => {
   const managerId = req.query.managerId;
 
-  const setUnavailableQuery = `
-    UPDATE bus b
-    JOIN driver_captin_trip dct ON b.BUS_ID = dct.BUS_ID
-    JOIN trip t ON dct.TRIP_ID = t.TRIP_ID
-    SET b.BUS_AVAILABILITY = 0
-    WHERE
-    BUS_AVAILABILITY != -1 AND
-      DATE_ADD(NOW(), INTERVAL 3 HOUR) BETWEEN 
-        CONCAT(t.TRIP_DATE, ' ', t.DEPARTURE_TIME)
-        AND CONCAT(
-          CASE 
-            WHEN t.RETURN_TIME < t.DEPARTURE_TIME THEN DATE_ADD(t.TRIP_DATE, INTERVAL 1 DAY)
-            ELSE t.TRIP_DATE
-          END,
-          ' ',
-          t.RETURN_TIME
-        )
-      AND t.STATUS_TRIP != 'Cancelled'
+  const query = `
+    SELECT 
+      b.BUS_ID AS busId,
+      b.PLATE_NUMBER AS plateNumber,
+      b.CAPACITY AS capacity,
+      b.BUS_MODEL AS model,
+      IF(
+        EXISTS (
+          SELECT 1
+          FROM driver_captin_trip dct
+          JOIN trip t ON t.TRIP_ID = dct.TRIP_ID
+          WHERE dct.BUS_ID = b.BUS_ID
+            AND DATE_ADD(NOW(), INTERVAL 3 HOUR) BETWEEN 
+              STR_TO_DATE(CONCAT(t.TRIP_DATE, ' ', t.DEPARTURE_TIME), '%Y-%m-%d %H:%i:%s') AND
+              STR_TO_DATE(
+                CONCAT(
+                  CASE 
+                    WHEN t.RETURN_TIME < t.DEPARTURE_TIME 
+                      THEN DATE_ADD(t.TRIP_DATE, INTERVAL 1 DAY)
+                    ELSE t.TRIP_DATE
+                  END,
+                  ' ',
+                  t.RETURN_TIME
+                ), 
+                '%Y-%m-%d %H:%i:%s'
+              )
+            AND t.STATUS_TRIP != 'Cancelled'
+        ),
+        'No',
+        'Yes'
+      ) AS availability
+    FROM bus b
+    WHERE b.MANAGER_ID = ? AND b.BUS_AVAILABILITY = 0;
   `;
 
-  db.query(setUnavailableQuery, (err) => {
+  db.query(query, [managerId], (err, result) => {
     if (err) {
       return res
         .status(500)
-        .json({ error: "Error updating unavailable buses: " + err.message });
+        .json({ error: "Error fetching buses: " + err.message });
     }
-
-    const setAvailableQuery = `
-  UPDATE bus
-  SET BUS_AVAILABILITY = 1
-  WHERE BUS_AVAILABILITY != -1
-    AND BUS_ID NOT IN (
-      SELECT b2.BUS_ID FROM (
-        SELECT dct.BUS_ID
-        FROM driver_captin_trip dct
-        JOIN trip t ON dct.TRIP_ID = t.TRIP_ID
-        WHERE
-          DATE_ADD(NOW(), INTERVAL 3 HOUR) BETWEEN 
-            CONCAT(t.TRIP_DATE, ' ', t.DEPARTURE_TIME)
-            AND CONCAT(
-              CASE 
-                WHEN t.RETURN_TIME < t.DEPARTURE_TIME THEN DATE_ADD(t.TRIP_DATE, INTERVAL 1 DAY)
-                ELSE t.TRIP_DATE
-              END,
-              ' ',
-              t.RETURN_TIME
-            )
-          AND t.STATUS_TRIP != 'Cancelled'
-      ) AS b2
-    )
-`;
-
-    db.query(setAvailableQuery, (err) => {
-      if (err) {
-        return res
-          .status(500)
-          .json({ error: "Error updating available buses: " + err.message });
-      }
-
-      const query = `
-        SELECT 
-          BUS_ID AS busId,
-          PLATE_NUMBER AS plateNumber,
-          CAPACITY AS capacity,
-          BUS_MODEL AS model,
-          BUS_AVAILABILITY AS availability
-        FROM bus
-        WHERE MANAGER_ID = ?
-      `;
-
-      db.query(query, [managerId], (err, result) => {
-        if (err) {
-          return res
-            .status(500)
-            .json({ error: "Error fetching buses: " + err.message });
-        }
-        res.json(result);
-      });
-    });
+    res.json(result);
   });
 });
 
@@ -680,43 +748,50 @@ app.post("/admin/createBus", async (req, res) => {
   try {
     const { plateNumber, managerId, capacity, busModel } = req.body;
 
-    if (!plateNumber || !managerId || !capacity || !busModel) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Missing required fields" });
-    }
+    const connection = db.promise();
 
-    const [existingBus] = await db
-      .promise()
-      .query("SELECT BUS_ID FROM bus WHERE PLATE_NUMBER = ?", [
-        plateNumber.trim(),
-      ]);
+    // Check if a bus with this plate number already exists
+    const [existingBusRows] = await connection.query(
+      "SELECT * FROM bus WHERE PLATE_NUMBER = ?",
+      [plateNumber.trim()]
+    );
 
-    if (existingBus.length > 0) {
+    if (existingBusRows.length > 0) {
+      const bus = existingBusRows[0];
+
+      if (bus.BUS_AVAILABILITY === 1) {
+        // Reactivate the archived bus
+        await connection.query(
+          `UPDATE bus 
+           SET BUS_AVAILABILITY = 0, MANAGER_ID = ?, CAPACITY = ?, BUS_MODEL = ? 
+           WHERE BUS_ID = ?`,
+          [managerId, parseInt(capacity, 10), busModel.trim(), bus.BUS_ID]
+        );
+
+        return res.json({
+          success: true,
+          message: "Archived bus reactivated and updated successfully",
+          busId: bus.BUS_ID,
+        });
+      }
+
       return res.status(409).json({
         success: false,
-        message: "Bus with this plate number already exists",
+        message: "Plate Number already used by an active bus",
       });
     }
 
-    const busAvailability = 1;
-
-    const [busResult] = await db.promise().query(
+    // Insert new bus
+    const [insertResult] = await connection.query(
       `INSERT INTO bus (PLATE_NUMBER, MANAGER_ID, CAPACITY, BUS_AVAILABILITY, BUS_MODEL)
-       VALUES (?, ?, ?, ?, ?)`,
-      [
-        plateNumber.trim(),
-        managerId,
-        parseInt(capacity, 10),
-        busAvailability,
-        busModel.trim(),
-      ]
+       VALUES (?, ?, ?, 0, ?)`,
+      [plateNumber.trim(), managerId, parseInt(capacity, 10), busModel.trim()]
     );
 
     res.status(201).json({
       success: true,
       message: "Bus created successfully",
-      busId: busResult.insertId,
+      busId: insertResult.insertId,
     });
   } catch (error) {
     console.error("Create Bus Error:", error);
@@ -766,73 +841,49 @@ app.post("/admin/deleteBus", async (req, res) => {
   try {
     const connection = db.promise();
 
-    // Check if bus exists and available
+    // Check if bus exists
     const [busRows] = await connection.query(
       "SELECT BUS_AVAILABILITY FROM bus WHERE BUS_ID = ?",
       [busId]
     );
 
     if (busRows.length === 0) {
-      return res.status(404).json({ message: "Bus not found" });
+      return res.status(404).json({ success: false, message: "Bus not found" });
     }
 
-    if (busRows[0].BUS_AVAILABILITY !== 1) {
-      return res
-        .status(400)
-        .json({ message: "Bus is not available for deletion" });
-    }
-
-    // Check if bus is assigned to any future trip that is not cancelled
+    // Check if bus is assigned to any current or future trip (not cancelled)
     const [tripRows] = await connection.query(
       `
-       SELECT COUNT(*) AS count
-  FROM driver_captin_trip dct
-  JOIN trip t ON dct.TRIP_ID = t.TRIP_ID
-  WHERE dct.BUS_ID = ?
-    AND CONCAT(t.TRIP_DATE, ' ', t.DEPARTURE_TIME) >= DATE_ADD(NOW(), INTERVAL 3 HOUR)
-    AND t.STATUS_TRIP != 'Cancelled'
+      SELECT COUNT(*) AS count
+      FROM driver_captin_trip dct
+      JOIN trip t ON dct.TRIP_ID = t.TRIP_ID
+      WHERE dct.BUS_ID = ?
+        AND CONCAT(t.TRIP_DATE, ' ', t.DEPARTURE_TIME) >= DATE_ADD(NOW(), INTERVAL 3 HOUR)
+        AND t.STATUS_TRIP != 'Cancelled'
       `,
       [busId]
     );
 
     if (tripRows[0].count > 0) {
       return res.status(400).json({
+        success: false,
         message:
-          "Cannot delete bus: It is already assigned to an upcoming trip",
+          "Cannot archive bus: It is assigned to a current or upcoming trip",
       });
     }
 
-    // Soft delete
+    // Proceed with soft delete (archive)
     await connection.query(
-      "UPDATE bus SET BUS_AVAILABILITY = -1 WHERE BUS_ID = ?",
+      "UPDATE bus SET BUS_AVAILABILITY = 1 WHERE BUS_ID = ?",
       [busId]
     );
 
-    res.json({ message: "Bus marked as deleted successfully" });
+    res.json({ success: true, message: "Bus archived successfully" });
   } catch (error) {
     console.error("Soft delete bus error:", error);
     res
       .status(500)
-      .json({ message: "Server error while marking bus as deleted" });
-  }
-});
-
-// Update Bus Status
-app.post("/admin/updateBusAvailability", async (req, res) => {
-  const { busId, availability } = req.body;
-
-  try {
-    await db
-      .promise()
-      .query("UPDATE bus SET BUS_AVAILABILITY = ? WHERE BUS_ID = ?", [
-        availability,
-        busId,
-      ]);
-
-    res.json({ message: "Bus availability updated successfully" });
-  } catch (error) {
-    console.error("Update Bus Availability Error:", error);
-    res.status(500).json({ message: "Failed to update bus availability" });
+      .json({ success: false, message: "Server error while archiving bus" });
   }
 });
 
@@ -842,69 +893,6 @@ app.get("/admin/trips", async (req, res) => {
   const connection = db.promise();
 
   try {
-    // 1. Set to Complete: if trip has ended
-    await connection.query(`
-      UPDATE trip
-      SET STATUS_TRIP = 'Complete'
-      WHERE 
-        CONCAT(
-          CASE 
-            WHEN RETURN_TIME < DEPARTURE_TIME THEN TRIP_DATE
-            ELSE TRIP_DATE
-          END, 
-          ' ',
-          RETURN_TIME
-        ) < DATE_ADD(NOW(), INTERVAL 3 HOUR)
-        AND STATUS_TRIP NOT IN ('Cancelled', 'Complete')
-    `);
-
-    // 2. Set to Active: we're between departure and return
-    await connection.query(`
-      UPDATE trip
-      SET STATUS_TRIP = 'Active'
-      WHERE 
-        CONCAT(TRIP_DATE, ' ', DEPARTURE_TIME) <= DATE_ADD(NOW(), INTERVAL 3 HOUR)
-        AND CONCAT(
-          CASE 
-            WHEN RETURN_TIME < DEPARTURE_TIME THEN DATE_ADD(TRIP_DATE, INTERVAL 1 DAY)
-            ELSE TRIP_DATE
-          END, 
-          ' ',
-          RETURN_TIME
-        ) >= DATE_ADD(NOW(), INTERVAL 3 HOUR)
-        AND STATUS_TRIP NOT IN ('Cancelled', 'Complete')
-    `);
-
-    // 3. Set to Full: bookings reached capacity
-    await connection.query(`
-      UPDATE trip t
-      JOIN (
-        SELECT TRIP_ID, COUNT(*) AS bookedSeats FROM book GROUP BY TRIP_ID
-      ) b ON b.TRIP_ID = t.TRIP_ID
-      JOIN driver_captin_trip dct ON dct.TRIP_ID = t.TRIP_ID
-      JOIN bus bs ON bs.BUS_ID = dct.BUS_ID
-      SET t.STATUS_TRIP = 'Full'
-      WHERE b.bookedSeats >= bs.CAPACITY
-        AND t.STATUS_TRIP NOT IN ('Cancelled', 'Complete', 'Active')
-    `);
-
-    // 4. Set to Cancelled: no bookings, and trip is about to start
-    await connection.query(`
-      UPDATE trip
-      SET STATUS_TRIP = 'Cancelled'
-      WHERE STATUS_TRIP NOT IN ('Complete', 'Cancelled', 'Active')
-        AND CONCAT(TRIP_DATE, ' ', DEPARTURE_TIME) <= DATE_ADD(DATE_ADD(NOW(), INTERVAL 3 HOUR), INTERVAL 5 MINUTE)
-        AND TRIP_ID NOT IN (SELECT DISTINCT TRIP_ID FROM book)
-    `);
-
-    // 5. Set to Pending: the rest
-    await connection.query(`
-      UPDATE trip
-      SET STATUS_TRIP = 'Pending'
-      WHERE STATUS_TRIP NOT IN ('Full', 'Active', 'Complete', 'Cancelled')
-    `);
-
-    // Fetch trips
     const [result] = await connection.query(
       `SELECT
           t.TRIP_ID,
@@ -1024,7 +1012,7 @@ app.post("/admin/availableDriversAndBuses", (req, res) => {
   FROM 
     bus b
   WHERE b.MANAGER_ID = ?
-    AND b.BUS_AVAILABILITY != -1
+    AND b.BUS_AVAILABILITY = 0
     AND b.BUS_ID NOT IN (
       SELECT dct.BUS_ID
       FROM driver_captin_trip dct
@@ -1097,6 +1085,7 @@ app.post("/admin/createTrip", async (req, res) => {
       [driverId, insertTripId, busId]
     );
 
+    // Stops
     if (Array.isArray(stops) && stops.length > 0) {
       const stopQueries = stops.map((stop) =>
         connection.query(
@@ -1107,6 +1096,29 @@ app.post("/admin/createTrip", async (req, res) => {
       await Promise.all(stopQueries);
     }
 
+    // Get driver token
+    const [driverData] = await connection.query(
+      "SELECT FCM_TOKEN, FULL_NAME FROM users WHERE USER_ID = ? AND FCM_TOKEN IS NOT NULL",
+      [driverId]
+    );
+
+    if (driverData.length > 0) {
+      const token = driverData[0].FCM_TOKEN;
+      const driverName = driverData[0].FULL_NAME;
+
+      const formattedDate = new Date(date).toLocaleDateString("en-US", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      });
+      const formattedTime = departureTime.slice(0, 5); // HH:mm
+
+      const title = "New Trip Assigned";
+      const body = `Hi ${driverName}, you have a new trip from ${departure} to ${destination} on ${formattedDate} at ${formattedTime}.`;
+
+      await sendNotificationToPassengers([token], title, body);
+    }
+
     res.json({ success: true });
   } catch (error) {
     console.error("Create trip error:", error);
@@ -1114,24 +1126,191 @@ app.post("/admin/createTrip", async (req, res) => {
   }
 });
 
-app.put("/admin/cancelTrip", (req, res) => {
+app.put("/admin/cancelTrip", async (req, res) => {
   const { tripId } = req.body;
 
-  const query = "UPDATE trip SET STATUS_TRIP = 'Cancelled' WHERE TRIP_ID = ?";
+  try {
+    const conn = db.promise();
 
-  db.query(query, [tripId], (err, result) => {
-    res.json({ success: true, message: "Trip cancelled successfully" });
-  });
+    const [tripInfo] = await conn.query(
+      `SELECT DEPARTURE_LOCATION, DESTINATION_LOCATION, DEPARTURE_TIME, TRIP_DATE
+       FROM trip WHERE TRIP_ID = ?`,
+      [tripId]
+    );
+
+    let tripMessage = "The trip you were assigned to has been cancelled.";
+    let passengerMessage = "Your booked trip has been cancelled.";
+
+    if (tripInfo.length > 0) {
+      const {
+        DEPARTURE_LOCATION,
+        DESTINATION_LOCATION,
+        DEPARTURE_TIME,
+        TRIP_DATE,
+      } = tripInfo[0];
+
+      const formattedDate = new Date(TRIP_DATE).toLocaleDateString("en-US", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      });
+
+      tripMessage = `Trip Cancelled: ${DEPARTURE_LOCATION} → ${DESTINATION_LOCATION} on ${formattedDate} at ${DEPARTURE_TIME} has been cancelled.`;
+      passengerMessage = `Your trip from ${DEPARTURE_LOCATION} to ${DESTINATION_LOCATION} on ${formattedDate} at ${DEPARTURE_TIME} has been cancelled.`;
+    }
+
+    await conn.query(
+      "UPDATE trip SET STATUS_TRIP = 'Cancelled' WHERE TRIP_ID = ?",
+      [tripId]
+    );
+
+    const [passengers] = await conn.query(
+      `SELECT u.FCM_TOKEN
+       FROM book b
+       JOIN users u ON b.USER_ID = u.USER_ID
+       WHERE b.TRIP_ID = ? AND u.FCM_TOKEN IS NOT NULL`,
+      [tripId]
+    );
+
+    const passengerTokens = passengers
+      .map((row) => row.FCM_TOKEN)
+      .filter(Boolean);
+
+    if (passengerTokens.length > 0) {
+      await sendNotificationToPassengers(
+        passengerTokens,
+        "Trip Cancelled",
+        passengerMessage
+      );
+    }
+
+    const [driverResult] = await conn.query(
+      `SELECT DRIVER_ID FROM driver_captin_trip WHERE TRIP_ID = ?`,
+      [tripId]
+    );
+
+    let driverToken = null;
+
+    if (driverResult.length > 0) {
+      const driverId = driverResult[0].DRIVER_ID;
+
+      const [driverData] = await conn.query(
+        `SELECT FCM_TOKEN FROM users WHERE USER_ID = ? AND FCM_TOKEN IS NOT NULL`,
+        [driverId]
+      );
+
+      if (driverData.length > 0) {
+        driverToken = driverData[0].FCM_TOKEN;
+      }
+    }
+
+    if (driverToken) {
+      await sendNotificationToPassengers(
+        [driverToken],
+        "Trip Cancelled",
+        tripMessage
+      );
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Trip cancelled. Notifications sent to passengers and driver.",
+    });
+  } catch (err) {
+    console.error("Error cancelling trip:", err);
+    res.status(500).json({ success: false, message: "Something went wrong." });
+  }
 });
 
-app.put("/admin/reactivateTrip", (req, res) => {
+app.put("/admin/reactivateTrip", async (req, res) => {
   const { tripId } = req.body;
-  const query = "UPDATE trip SET STATUS_TRIP = 'Pending' WHERE TRIP_ID = ?";
-  db.query(query, [tripId], (err, result) => {
-    res.json({ success: true, message: "Trip reactivated successfully" });
-  });
+  const connection = db.promise();
+
+  try {
+    // Update trip status
+    await connection.query(
+      "UPDATE trip SET STATUS_TRIP = 'Pending' WHERE TRIP_ID = ?",
+      [tripId]
+    );
+
+    // Fetch trip details
+    const [tripInfo] = await connection.query(
+      `SELECT DEPARTURE_LOCATION, DESTINATION_LOCATION, DEPARTURE_TIME, TRIP_DATE
+       FROM trip WHERE TRIP_ID = ?`,
+      [tripId]
+    );
+
+    if (tripInfo.length === 0) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Trip not found" });
+    }
+
+    const {
+      DEPARTURE_LOCATION,
+      DESTINATION_LOCATION,
+      DEPARTURE_TIME,
+      TRIP_DATE,
+    } = tripInfo[0];
+
+    const formattedDate = new Date(TRIP_DATE).toLocaleDateString("en-US", {
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+
+    const tripMessage = `Your trip from ${DEPARTURE_LOCATION} to ${DESTINATION_LOCATION} on ${formattedDate} at ${DEPARTURE_TIME} is reactivated.`;
+
+    // 1. Notify passengers
+    const [passengers] = await connection.query(
+      `SELECT u.FCM_TOKEN
+       FROM book b
+       JOIN users u ON b.USER_ID = u.USER_ID
+       WHERE b.TRIP_ID = ? AND u.FCM_TOKEN IS NOT NULL`,
+      [tripId]
+    );
+
+    const passengerTokens = passengers.map((p) => p.FCM_TOKEN).filter(Boolean);
+
+    if (passengerTokens.length > 0) {
+      await sendNotificationToPassengers(
+        passengerTokens,
+        "Trip Reactivated",
+        tripMessage
+      );
+    }
+
+    // 2. Notify driver
+    const [driverResult] = await connection.query(
+      `SELECT d.DRIVER_ID, u.FCM_TOKEN, u.FULL_NAME
+       FROM driver_captin_trip d
+       JOIN users u ON d.DRIVER_ID = u.USER_ID
+       WHERE d.TRIP_ID = ? AND u.FCM_TOKEN IS NOT NULL`,
+      [tripId]
+    );
+
+    if (driverResult.length > 0) {
+      const driver = driverResult[0];
+      const driverMsg = `Hi ${driver.FULL_NAME}, your trip from ${DEPARTURE_LOCATION} to ${DESTINATION_LOCATION} on ${formattedDate} at ${DEPARTURE_TIME} is reactivated.`;
+
+      await sendNotificationToPassengers(
+        [driver.FCM_TOKEN],
+        "Trip Reactivated",
+        driverMsg
+      );
+    }
+
+    res.json({
+      success: true,
+      message: "Trip reactivated and notifications sent.",
+    });
+  } catch (err) {
+    console.error("Error reactivating trip:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
 });
 
+// Update Trip with full notifications logic
 app.put("/admin/updateTrip", async (req, res) => {
   const {
     departure,
@@ -1145,13 +1324,31 @@ app.put("/admin/updateTrip", async (req, res) => {
     driverId,
     managerId,
     departureCoords,
+    tripId,
   } = req.body;
 
-  const { tripId } = req.body;
   const connection = db.promise();
 
   try {
-    // 1. Update main trip info
+    // Fetch old trip info
+    const [oldTrip] = await connection.query(
+      `SELECT t.DEPARTURE_LOCATION, t.DESTINATION_LOCATION, t.SEAT_PRICE,
+              t.TRIP_DATE, t.DEPARTURE_TIME, t.RETURN_TIME,
+              dct.DRIVER_ID
+       FROM trip t
+       JOIN driver_captin_trip dct ON t.TRIP_ID = dct.TRIP_ID
+       WHERE t.TRIP_ID = ?`,
+      [tripId]
+    );
+
+    const old = oldTrip[0];
+    const oldDriverId = old.DRIVER_ID;
+    const oldDepartureTime = old.DEPARTURE_TIME;
+    const oldSeatPrice = old.SEAT_PRICE;
+    const oldReturnTime = old.RETURN_TIME;
+    const oldTripDate = old.TRIP_DATE;
+
+    // Update trip
     await connection.query(
       `UPDATE trip SET
         TRIP_DATE = ?, 
@@ -1176,22 +1373,18 @@ app.put("/admin/updateTrip", async (req, res) => {
       ]
     );
 
-    // 2. Update driver & bus assignment
+    // Update driver & bus
     await connection.query(
-      `UPDATE driver_captin_trip SET 
-        DRIVER_ID = ?, 
-        BUS_ID = ?
-      WHERE TRIP_ID = ?`,
+      `UPDATE driver_captin_trip SET DRIVER_ID = ?, BUS_ID = ? WHERE TRIP_ID = ?`,
       [driverId, busId, tripId]
     );
 
-    // 3. Delete existing stops
+    // Delete old stops & insert new ones
     await connection.query(
       "DELETE FROM trip_specific_location WHERE TRIP_ID = ?",
       [tripId]
     );
 
-    // 4. Insert new stops
     if (Array.isArray(stops) && stops.length > 0) {
       const stopQueries = stops.map((stop) =>
         connection.query(
@@ -1202,10 +1395,333 @@ app.put("/admin/updateTrip", async (req, res) => {
       await Promise.all(stopQueries);
     }
 
+    // Notify old driver if changed
+    if (oldDriverId !== driverId) {
+      const [oldDriver] = await connection.query(
+        "SELECT FCM_TOKEN FROM users WHERE USER_ID = ? AND FCM_TOKEN IS NOT NULL",
+        [oldDriverId]
+      );
+
+      if (oldDriver.length > 0) {
+        await sendNotificationToPassengers(
+          [oldDriver[0].FCM_TOKEN],
+          "Trip Update",
+          "You have been unassigned from a trip. Please check your schedule."
+        );
+      }
+    }
+
+    // Notify new driver
+    const [newDriver] = await connection.query(
+      "SELECT FULL_NAME, FCM_TOKEN FROM users WHERE USER_ID = ? AND FCM_TOKEN IS NOT NULL",
+      [driverId]
+    );
+
+    if (newDriver.length > 0) {
+      const { FULL_NAME, FCM_TOKEN } = newDriver[0];
+      const formattedDate = new Date(date).toLocaleDateString("en-US", {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      });
+      const time = departureTime.slice(0, 5);
+      const msg = `Hi ${FULL_NAME}, you have a new trip from ${departure} to ${destination} on ${formattedDate} at ${time}.`;
+      await sendNotificationToPassengers([FCM_TOKEN], "New Trip Assigned", msg);
+    }
+
+    // Notify passengers if trip info changed
+    const tripChanged =
+      oldDepartureTime !== departureTime ||
+      oldSeatPrice !== price ||
+      oldReturnTime !== returnTime ||
+      oldTripDate !== date;
+
+    if (tripChanged) {
+      const [passengers] = await connection.query(
+        `SELECT u.FCM_TOKEN FROM book b
+         JOIN users u ON b.USER_ID = u.USER_ID
+         WHERE b.TRIP_ID = ? AND u.FCM_TOKEN IS NOT NULL`,
+        [tripId]
+      );
+
+      const passengerTokens = passengers
+        .map((p) => p.FCM_TOKEN)
+        .filter(Boolean);
+
+      if (passengerTokens.length > 0) {
+        await sendNotificationToPassengers(
+          passengerTokens,
+          "Trip Updated",
+          "Your booked trip details have been updated. Please check the app."
+        );
+      }
+    }
+
     res.json({ success: true });
   } catch (error) {
     console.error("Update trip error:", error);
     res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+app.get("/admin/dashboardStats", async (req, res) => {
+  const manager_id = req.query.manager_id;
+  if (!manager_id) {
+    return res
+      .status(400)
+      .json({ success: false, message: "Missing manager_id" });
+  }
+
+  const connection = db.promise();
+
+  try {
+    const [
+      [buses],
+      [trips],
+      [completedTrips],
+      [passengers],
+      [drivers],
+      [revenueToday],
+      [revenueYesterday],
+      [bookedSeats],
+      [totalSeats],
+    ] = await Promise.all([
+      connection.execute(
+        `SELECT COUNT(*) AS count
+         FROM bus b
+         WHERE b.MANAGER_ID = ? 
+         AND b.BUS_AVAILABILITY != 1
+         AND NOT EXISTS (
+         SELECT 1
+        FROM driver_captin_trip dct
+        JOIN trip t ON dct.TRIP_ID = t.TRIP_ID
+        WHERE dct.BUS_ID = b.BUS_ID
+         AND t.TRIP_DATE = CURDATE()
+        AND DATE_FORMAT(DATE_ADD(NOW(), INTERVAL 3 HOUR), '%H:%i:%s') BETWEEN t.DEPARTURE_TIME AND t.RETURN_TIME
+  );
+`,
+        [manager_id]
+      ),
+      connection.execute(
+        `SELECT COUNT(*) AS count FROM trip WHERE MANAGER_ID = ? AND STATUS_TRIP = 'active' AND TRIP_DATE = CURDATE()`,
+        [manager_id]
+      ),
+      connection.execute(
+        `SELECT COUNT(*) AS count FROM trip WHERE MANAGER_ID = ? AND STATUS_TRIP = 'complete' AND TRIP_DATE = CURDATE()`,
+        [manager_id]
+      ),
+      connection.execute(
+        `SELECT COUNT(*) AS count FROM user_follow_manager WHERE MANAGER_ID = ? AND USER_STATUS = 1`,
+        [manager_id]
+      ),
+      connection.execute(
+        `SELECT COUNT(*) AS count
+        FROM driver d
+        WHERE d.MANAGER_ID = ? 
+       AND d.AVAILABILITY != 1
+       AND NOT EXISTS (
+      SELECT 1
+      FROM driver_captin_trip dct
+      JOIN trip t ON dct.TRIP_ID = t.TRIP_ID
+      WHERE dct.DRIVER_ID = d.DRIVER_ID
+      AND t.TRIP_DATE = CURDATE()
+      AND DATE_FORMAT(DATE_ADD(NOW(), INTERVAL 3 HOUR), '%H:%i:%s') BETWEEN t.DEPARTURE_TIME AND t.RETURN_TIME
+  );
+`,
+        [manager_id]
+      ),
+      connection.execute(
+        `SELECT SUM(PAYMENT) AS total FROM book 
+         JOIN trip ON book.TRIP_ID = trip.TRIP_ID 
+         WHERE CHECK_PAY = 1 AND PAYMENT_DATE = CURDATE() AND trip.MANAGER_ID = ?`,
+        [manager_id]
+      ),
+      connection.execute(
+        `SELECT SUM(PAYMENT) AS total FROM book 
+         JOIN trip ON book.TRIP_ID = trip.TRIP_ID 
+         WHERE CHECK_PAY = 1 AND PAYMENT_DATE = CURDATE() - INTERVAL 1 DAY AND trip.MANAGER_ID = ?`,
+        [manager_id]
+      ),
+      connection.execute(
+        `SELECT COUNT(*) AS count FROM book 
+         JOIN trip ON book.TRIP_ID = trip.TRIP_ID 
+         WHERE CHECK_PAY = 1 AND book.PAYMENT_DATE = CURDATE() AND trip.MANAGER_ID = ?`,
+        [manager_id]
+      ),
+      connection.execute(
+        `SELECT SUM(b.CAPACITY) AS total FROM trip t 
+         JOIN driver_captin_trip dct ON t.TRIP_ID = dct.TRIP_ID 
+         JOIN bus b ON dct.BUS_ID = b.BUS_ID 
+         WHERE t.TRIP_DATE = CURDATE() AND t.MANAGER_ID = ?`,
+        [manager_id]
+      ),
+    ]);
+
+    const seatRate = totalSeats[0].total
+      ? ((bookedSeats[0].count / totalSeats[0].total) * 100).toFixed(1) + "%"
+      : "0%";
+
+    function calcGrowth(today, yesterday) {
+      if (!yesterday || yesterday === 0) return "--%";
+      return (((today - yesterday) / yesterday) * 100).toFixed(1) + "%";
+    }
+
+    res.json({
+      success: true,
+      stats: {
+        buses: { value: buses[0].count },
+        trips: { value: trips[0].count },
+        completedTrips: { value: completedTrips[0].count },
+        passengers: { value: passengers[0].count },
+        drivers: { value: drivers[0].count },
+        revenue: {
+          value: revenueToday[0].total || 0,
+          growth: calcGrowth(
+            revenueToday[0].total || 0,
+            revenueYesterday[0].total || 0
+          ),
+        },
+        seatOccupancy: { value: seatRate },
+      },
+    });
+  } catch (err) {
+    console.error("Error in /admin/dashboardStats:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+app.get("/admin/passengerTraffic", async (req, res) => {
+  const manager_id = req.query.manager_id;
+  if (!manager_id) {
+    return res
+      .status(400)
+      .json({ success: false, message: "Missing manager_id" });
+  }
+
+  const connection = db.promise();
+  try {
+    const [thisWeekResult, lastWeekResult] = await Promise.all([
+      connection.execute(
+        `SELECT DAYNAME(PAYMENT_DATE) AS day, COUNT(*) AS count
+         FROM book
+         JOIN trip ON book.TRIP_ID = trip.TRIP_ID
+         WHERE trip.MANAGER_ID = ?
+           AND CHECK_PAY = 1
+           AND YEARWEEK(PAYMENT_DATE, 1) = YEARWEEK(CURDATE(), 1)
+         GROUP BY day`,
+        [manager_id]
+      ),
+      connection.execute(
+        `SELECT DAYNAME(PAYMENT_DATE) AS day, COUNT(*) AS count
+         FROM book
+         JOIN trip ON book.TRIP_ID = trip.TRIP_ID
+         WHERE trip.MANAGER_ID = ?
+           AND CHECK_PAY = 1
+           AND YEARWEEK(PAYMENT_DATE, 1) = YEARWEEK(CURDATE() - INTERVAL 1 WEEK, 1)
+         GROUP BY day`,
+        [manager_id]
+      ),
+    ]);
+
+    const thisWeek = thisWeekResult[0];
+    const lastWeek = lastWeekResult[0];
+
+    const weekDays = [
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday",
+      "Sunday",
+    ];
+    const formatCounts = (data) => {
+      const map = Object.fromEntries(data.map((d) => [d.day, d.count]));
+      return weekDays.map((day) => map[day] || 0);
+    };
+
+    res.json({
+      success: true,
+      days: weekDays,
+      thisWeek: formatCounts(thisWeek),
+      lastWeek: formatCounts(lastWeek),
+    });
+  } catch (err) {
+    console.error("Error in /admin/passengerTraffic:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+app.get("/admin/revenuePerDay", async (req, res) => {
+  const manager_id = req.query.manager_id;
+
+  if (!manager_id) {
+    return res
+      .status(400)
+      .json({ success: false, message: "Missing manager_id" });
+  }
+
+  const connection = db.promise();
+
+  try {
+    const [rows] = await connection.execute(
+      `
+      SELECT 
+        DAYNAME(DATE(PAYMENT_DATE)) AS day,
+        SUM(PAYMENT) AS revenue
+      FROM book
+      JOIN trip ON book.TRIP_ID = trip.TRIP_ID
+      WHERE 
+        CHECK_PAY = 1 AND 
+        trip.MANAGER_ID = ? AND 
+        WEEK(PAYMENT_DATE, 1) = WEEK(CURDATE(), 1) AND 
+        YEAR(PAYMENT_DATE) = YEAR(CURDATE())
+      GROUP BY day
+      ORDER BY FIELD(day, 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday')
+      `,
+      [manager_id]
+    );
+
+    const formatted = rows.map((r) => ({
+      day: r.day,
+      revenue: Number(r.revenue),
+    }));
+
+    res.json({ success: true, data: formatted });
+  } catch (err) {
+    console.error("Error in /admin/revenuePerDay:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+app.get("/admin/revenuePerMonth", async (req, res) => {
+  const manager_id = req.query.manager_id;
+  if (!manager_id) {
+    return res
+      .status(400)
+      .json({ success: false, message: "Missing manager_id" });
+  }
+
+  try {
+    const [rows] = await db.promise().execute(
+      `SELECT 
+         DATE_FORMAT(b.PAYMENT_DATE, '%Y-%m') AS month,
+         SUM(b.PAYMENT) AS total_revenue
+       FROM 
+         book b
+       JOIN 
+         trip t ON b.TRIP_ID = t.TRIP_ID
+       WHERE 
+         b.CHECK_PAY = 1 AND t.MANAGER_ID = ?
+       GROUP BY month
+       ORDER BY month ASC`,
+      [manager_id]
+    );
+
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    console.error("Revenue Per Month Error:", err);
+    res.status(500).json({ success: false, message: "Internal server error" });
   }
 });
 
